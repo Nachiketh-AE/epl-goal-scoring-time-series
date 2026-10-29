@@ -4,7 +4,7 @@ Final project for DACSS 790D: Temporal Dynamics (UMass Amherst, Spring 2026).
 
 This project models weekly average goal scoring in the Premier League across five seasons and tests whether adding expected goals (xG) to an ARIMA model improves forecasts over a univariate baseline.
 
-**[View the full report (HTML)](790D_final_project.html)**
+**[View the full report (HTML)](https://nachiii-1705.github.io/epl-goal-scoring-time-series/790D_final_project.html)**
 
 ## Data
 
