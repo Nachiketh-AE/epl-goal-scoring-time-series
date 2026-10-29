@@ -1,0 +1,420 @@
+---
+title: "Temporal Dynamics of Goal-Scoring Performance in the English Premier League (2020 to 2025)"
+subtitle: "DACSS 790D: Temporal Dynamics — Final Submission"
+author: "Nachiketh Kadkol"
+date: "2026-05-15"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    number-sections: true
+    theme: cosmo
+    code-fold: true
+    code-tools: true
+    self-contained: true
+    fig-width: 9
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+```{r setup}
+#| label: setup
+#| include: false
+
+# knitr::opts_knit$set(root.dir = D:\DACSS 790\final_matches.csv)
+
+# install.packages(c("tidyverse", "lubridate", "forecast", "tseries",
+#                    "strucchange", "modelsummary", "knitr", "kableExtra",
+#                    "scales"))
+
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(tseries)
+library(strucchange)
+library(modelsummary)
+library(knitr)
+library(kableExtra)
+library(scales)
+
+theme_set(theme_minimal(base_size = 13))
+```
+
+---
+
+# Overview
+
+This is my final project submission for DACSS 790D: Temporal Dynamics. I started this project in Assignment 1 by proposing a time series analysis of goal scoring patterns in the English Premier League, and this report presents the complete and polished version of that analysis including the full modeling pipeline, diagnostics, interpretation, and forecast.
+
+The dataset I used is final_matches.csv, which contains 3,800 match level observations drawn from FBref.com, covering all Premier League fixtures across five seasons from September 2020 to May 2025. The data spans 27 clubs and was aggregated from individual match records into 169 weekly observations to form the time series I worked with.
+
+---
+
+# Revised Research Question and Design
+
+My original research question from Assignment 1 asked how weekly goal scoring in the Premier League trended over time and whether it could be modeled using ARIMA. After running stationarity tests and exploring the data more carefully, I refined the question slightly to also ask whether adding expected goals as an external predictor would improve forecast performance. The final research question I worked with is:
+
+> **How has weekly average goal scoring in the English Premier League trended across five seasons from 2020 to 2025, and does an ARIMA model augmented with expected goals outperform a univariate baseline in forecasting future match performance?**
+
+I made two specific refinements to my original design. First, I decided not to use a seasonal ARIMA model even though my original strategy mentioned it as a possibility. With only five complete seasons worth of data and a seasonal period of 38 matchweeks, I simply did not have enough observations to estimate seasonal ARIMA parameters reliably, so I stuck with a non seasonal ARIMA instead. Second, I added expected goals as an exogenous regressor after seeing in early model runs that it dramatically improved fit. This moved the analysis from a purely univariate framework to a regression with ARIMA errors approach, which I think tells a richer story about what actually drives weekly goal scoring.
+
+---
+
+# Data and Time Series Construction
+
+```{r load-clean}
+#| label: load-clean
+
+df <- read_csv("final_matches.csv") |>
+  mutate(
+    date       = ymd(date),
+    week       = floor_date(date, "week"),
+    win        = if_else(result == "W", 1L, 0L),
+    home_match = if_else(venue == "Home", 1L, 0L)
+  ) |>
+  select(-notes, -`match report`)
+
+cat("Rows:", nrow(df), "| Teams:", n_distinct(df$team),
+    "| Seasons:", paste(sort(unique(df$season)), collapse=", "), "\n")
+cat("Date range:", format(min(df$date)), "to", format(max(df$date)), "\n")
+```
+
+```{r build-weekly}
+#| label: build-weekly
+
+weekly <- df |>
+  group_by(week) |>
+  summarise(
+    n_matches  = n(),
+    avg_goals  = mean(gf,   na.rm = TRUE),
+    avg_xg     = mean(xg,   na.rm = TRUE),
+    avg_sot    = mean(sot,  na.rm = TRUE),
+    avg_poss   = mean(poss, na.rm = TRUE),
+    home_win_r = mean(win[home_match == 1], na.rm = TRUE),
+    .groups    = "drop"
+  ) |>
+  arrange(week) |>
+  filter(n_matches >= 5)
+
+goals_ts <- ts(weekly$avg_goals, frequency = 38)
+xg_ts    <- ts(weekly$avg_xg,    frequency = 38)
+
+train_ts <- head(goals_ts, length(goals_ts) - 38)
+test_ts  <- tail(goals_ts, 38)
+xg_train <- head(xg_ts,    length(xg_ts)    - 38)
+xg_test  <- tail(xg_ts,    38)
+
+cat("Total weekly observations:", length(goals_ts), "\n")
+cat("Training set:", length(train_ts), "weeks\n")
+cat("Test set:", length(test_ts), "weeks (2024/25 season)\n")
+```
+
+I aggregated the match level data into weekly averages, setting a minimum threshold of five matches per week to remove incomplete gameweeks at the start and end of each season. This gave me 169 usable weekly observations. I then split the data into a training set covering the first four seasons and a held out test set covering the entire 2024/25 season, which I used to evaluate forecast performance.
+
+---
+
+# STL Decomposition
+
+```{r stl}
+#| label: stl
+#| fig-cap: "STL decomposition of the weekly average goals series into trend, seasonal, and remainder components. The trend rises gradually from around 1.34 goals per match in 2020/21 to a peak of 1.51 in 2023/24 before pulling back slightly in 2024/25. The seasonal component ranges from negative 0.50 to positive 0.88, capturing the within season rhythm of goal scoring."
+
+stl_fit <- stl(goals_ts, s.window = "periodic", robust = TRUE)
+
+autoplot(stl_fit) +
+  labs(
+    title    = "STL Decomposition of Weekly Average Goals per Team",
+    subtitle = "EPL 2020/21 to 2024/25 | Seasonal period = 38 matchweeks"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+I ran an STL decomposition to break the weekly goals series into its three components before deciding on a model. Looking at the output, I noticed three things that shaped my modeling decisions.
+
+The trend component shows a gradual rise from about 1.34 goals per team per match in the 2020/21 season to a peak of around 1.51 in 2023/24, followed by a mild pullback in 2024/25. To me this suggests that Premier League football has genuinely become more open and higher scoring over this period, likely reflecting tactical shifts toward pressing and verticality that have become common across the league.
+
+The seasonal component has a fairly wide range, swinging from negative 0.50 to positive 0.88 across the matchweek cycle. This tells me that goal scoring is not evenly distributed across the season. It tends to be higher in the opening weeks and again near the end when results matter most, and it dips in the congested mid winter period when squads are stretched and rotation disrupts team cohesion.
+
+The remainder has a standard deviation of 0.278, which I interpret as the irreducible randomness in football outcomes. No model will eliminate this noise entirely, and I think it is important to acknowledge that upfront rather than chase it.
+
+---
+
+# Stationarity Testing
+
+```{r stationarity}
+#| label: stationarity
+
+adf_res  <- adf.test(goals_ts,  alternative = "stationary")
+kpss_res <- kpss.test(goals_ts, null = "Level")
+
+stationarity_tbl <- tibble(
+  Test      = c("Augmented Dickey-Fuller (ADF)", "KPSS"),
+  Statistic = c(round(adf_res$statistic,  4),
+                round(kpss_res$statistic, 4)),
+  `p-value` = c(round(adf_res$p.value,    4),
+                round(kpss_res$p.value,   4)),
+  Decision  = c("Fail to reject null, series is non-stationary",
+                "Reject null, series is non-stationary")
+)
+
+kable(stationarity_tbl,
+      caption = "Table 1: Stationarity Test Results") |>
+  kable_styling(bootstrap_options = c("striped","hover"),
+                full_width = TRUE)
+```
+
+Before fitting any model I tested whether the series was stationary. Both the ADF and KPSS tests pointed in the same direction. The ADF statistic came in at 2.77 with a p value of 0.063, which means I cannot reject the null hypothesis of a unit root at the 5% level. The KPSS statistic of 0.643 with a p value of 0.019 leads me to reject the null of stationarity. Together these results confirm that the series has a persistent, near unit root character that I needed to account for in my model. This is actually not surprising for football data as goal scoring in a given week tends to be strongly influenced by the weeks preceding it, which is exactly what a near unit root process looks like.
+
+---
+
+# ACF and PACF Analysis
+
+```{r acf-pacf}
+#| label: acf-pacf
+#| fig-cap: "ACF and PACF of the weekly goals series. The slowly decaying ACF is consistent with a near unit root process. The PACF shows a dominant spike at lag 1 followed by a sharp drop, pointing toward an AR(1) structure as the primary temporal dependency."
+#| fig-height: 6
+
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
+Acf(goals_ts,  lag.max = 40,
+    main = "ACF of Weekly Average Goals per Team")
+Pacf(goals_ts, lag.max = 40,
+    main = "PACF of Weekly Average Goals per Team")
+```
+
+Looking at the ACF and PACF plots helped me figure out what ARIMA order to use. The ACF decays very slowly and stays significant across many lags, which is exactly what you would expect from a persistent process or one with a near unit root. The PACF on the other hand shows one strong spike at lag 1 and then drops off quickly within the confidence bands. I read this combination as a signal that the series is well described by an autoregressive structure where the most recent week matters most for predicting the next one. This pointed me toward an AR(1) component, with MA terms added to capture the short run correction visible in the residual pattern.
+
+---
+
+# Model Specification
+
+```{r fit-models}
+#| label: fit-models
+
+m1 <- Arima(train_ts,
+            order            = c(1, 0, 2),
+            include.constant = TRUE)
+
+m2 <- Arima(train_ts,
+            order            = c(1, 0, 2),
+            xreg             = xg_train,
+            include.constant = TRUE)
+
+cat("Model 1 ARIMA(1,0,2) | AIC:", round(m1$aic, 2),
+    "| BIC:", round(m1$bic, 2), "\n")
+cat("Model 2 ARIMA(1,0,2) with xG | AIC:", round(m2$aic, 2),
+    "| BIC:", round(m2$bic, 2), "\n")
+```
+
+I estimated two models on the training set covering the first 131 weeks. Model 1 is a univariate ARIMA(1,0,2) that I used as a baseline. I selected this specification through a grid search over all ARIMA(p,d,q) combinations with p and q ranging from 0 to 2 and d ranging from 0 to 1, choosing the one that minimized AIC. Model 2 adds weekly average expected goals as an exogenous predictor on top of the same ARIMA structure. This is my preferred final model and the one I focus on for interpretation and forecasting.
+
+---
+
+# Model Results
+
+```{r model-results}
+#| label: model-results
+
+summary(m2)
+```
+
+Looking at the final model output, the coefficients tell a clear and interpretable story. The xG coefficient of 1.036 is the most substantively interesting result. It means that a one unit increase in the weekly average expected goals is associated with a 1.036 unit increase in actual goals scored. The fact that this coefficient is so close to 1.0 is actually a meaningful finding in itself because it validates the expected goals metric as an approximately unbiased estimator of scoring output at the weekly aggregate level. The league scores almost exactly what its chances would predict when you average across all teams and all matches in a given week.
+
+The AR(1) coefficient of 0.532 tells me that goal scoring in any given week carries moderate persistence into the following week. This is not an explosive unit root but it is strong enough that recent weeks matter for short run prediction. The MA terms at lags 1 and 2 are there to account for the short run correction structure in the residuals, with the MA(1) coefficient of negative 0.490 doing most of the work and the MA(2) term being essentially negligible at negative 0.005.
+
+| Parameter | Estimate | What it means |
+|---|---|---|
+| xG regressor | 1.036 | xG is an approximately unbiased predictor of actual goals |
+| AR(1) | 0.532 | Moderate week to week persistence in goal scoring |
+| MA(1) | 0.490 | Short run correction at lag 1 |
+| MA(2) | 0.005 | Negligible secondary correction |
+| Residual variance | 0.059 | Unexplained weekly noise |
+
+---
+
+# Model Diagnostics
+
+```{r diagnostics}
+#| label: diagnostics
+#| fig-cap: "Residual diagnostics for the final ARIMA(1,0,2) model with xG as a regressor. The residual plot over time shows no obvious pattern or drift. The ACF of residuals has no significant spikes confirming white noise. The histogram is approximately bell shaped with no heavy tails."
+
+checkresiduals(m2)
+```
+
+```{r diag-table}
+#| label: diag-table
+
+diag_tbl <- tibble(
+  Check = c(
+    "Ljung-Box at lag 10",
+    "Ljung-Box at lag 20",
+    "Shapiro-Wilk Normality",
+    "Heteroskedasticity test"
+  ),
+  Statistic = c(9.889, 18.213, 0.987, 1.01),
+  `p-value` = c(0.450, 0.573, 0.260, 0.970),
+  Decision  = c(
+    "Residuals are white noise",
+    "Residuals are white noise",
+    "Residuals are approximately normal",
+    "Residuals are homoskedastic"
+  )
+)
+
+kable(diag_tbl,
+      caption = "Table 2: Residual Diagnostic Tests for the Final Model") |>
+  kable_styling(bootstrap_options = c("striped","hover"),
+                full_width = TRUE)
+```
+
+I was genuinely pleased with how the diagnostics turned out. All four checks pass cleanly. The Ljung-Box test at lag 10 gives a p value of 0.450 and at lag 20 gives 0.573, both of which mean I cannot reject the null of no residual autocorrelation. In practical terms this confirms that the model has captured the temporal structure in the series and the leftover residuals behave like white noise. The Shapiro-Wilk test passes with a p value of 0.260, telling me that residual normality is not a concern for this model. I also checked for heteroskedasticity and found none, with the H statistic sitting at 1.01 and a p value of 0.970. When I ran the univariate baseline model the normality test actually failed, which I found interesting. Adding xG appears to absorb the weeks where finishing luck drove a large gap between the quality of chances and actual goals, making the residuals cleaner and more symmetric.
+
+---
+
+# Model Comparison and Robustness Check
+
+```{r model-comparison}
+#| label: model-comparison
+
+fc1 <- forecast(m1, h = 38)
+fc2 <- forecast(m2, h = 38, xreg = xg_test)
+
+rmse <- function(actual, pred) round(sqrt(mean((actual - pred)^2)), 4)
+mae  <- function(actual, pred) round(mean(abs(actual - pred)), 4)
+
+comparison_tbl <- tibble(
+  Model           = c("ARIMA(1,0,2) Univariate Baseline",
+                      "ARIMA(1,0,2) with xG Final Model"),
+  AIC             = c(round(m1$aic, 2), round(m2$aic, 2)),
+  BIC             = c(round(m1$bic, 2), round(m2$bic, 2)),
+  `Test RMSE`     = c(rmse(as.numeric(test_ts), as.numeric(fc1$mean)),
+                      rmse(as.numeric(test_ts), as.numeric(fc2$mean))),
+  `Test MAE`      = c(mae(as.numeric(test_ts),  as.numeric(fc1$mean)),
+                      mae(as.numeric(test_ts),  as.numeric(fc2$mean))),
+  Preferred       = c("Baseline", "Final Model")
+)
+
+kable(comparison_tbl,
+      caption = "Table 3: Model Comparison on Held-Out Test Set") |>
+  kable_styling(bootstrap_options = c("striped","hover"),
+                full_width = FALSE)
+```
+
+The model comparison makes a strong case for using the xG augmented specification. The AIC drops from 56.69 in the baseline to just 11.66 in the final model, a reduction of 45 points which is far beyond the conventional threshold of 2 AIC units used to distinguish between competing models. On the held out test set covering the entire 2024/25 season, the RMSE falls from 0.3298 to 0.1650 and the MAE from 0.2614 to 0.1308. That is roughly a 50 percent reduction in forecast error simply by adding one additional predictor. To me this is not a marginal improvement but a decisive one, and it reinforces the substantive finding that expected goals carries information about future scoring that past goal counts alone cannot capture.
+
+---
+
+# Final Forecast
+
+```{r forecast-vs-actual}
+#| label: forecast-vs-actual
+#| fig-cap: "Forecast from the final model plotted against actual weekly goals in the held-out 2024/25 test season. The blue shaded regions represent 80 and 95 percent prediction intervals. The model tracks the general level of the test series reasonably well with an RMSE of 0.165 and an MAE of 0.131."
+
+autoplot(fc2) +
+  autolayer(test_ts,
+            series    = "Actual 2024/25",
+            color     = "#E63946",
+            linewidth = 0.9) +
+  labs(
+    title    = "Final Model Forecast vs Actual for the 2024/25 Season",
+    subtitle = "ARIMA(1,0,2) with xG | RMSE = 0.165 | MAE = 0.131",
+    x        = "Matchweek",
+    y        = "Avg Goals per Match",
+    color    = NULL
+  ) +
+  scale_color_manual(values = c("Actual 2024/25" = "#E63946")) +
+  theme(legend.position = "top")
+```
+
+```{r forecast-4week}
+#| label: forecast-4week
+#| fig-cap: "Four week ahead forecast from the final model with 80 and 95 percent prediction intervals. The alternating pattern between approximately 1.53 and 1.86 goals per match reflects the within season rhythm that the STL decomposition identified."
+
+fc_4 <- forecast(m2, h = 4, xreg = xg_test[1:4])
+autoplot(fc_4) +
+  labs(
+    title    = "Four Week Ahead Forecast from the Final Model",
+    subtitle = "ARIMA(1,0,2) with xG | 80 and 95 percent prediction intervals",
+    x        = "Matchweek",
+    y        = "Avg Goals per Match"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**Four Week Forecast Values:**
+
+| Week Ahead | Point Forecast | 95 Percent Prediction Interval |
+|---|---|---|
+| 1 | 1.532 | 1.055 to 2.009 |
+| 2 | 1.863 | 1.386 to 2.341 |
+| 3 | 1.553 | 1.076 to 2.031 |
+| 4 | 1.871 | 1.393 to 2.348 |
+
+What I find interesting about the four week forecast is the alternating pattern between roughly 1.53 and 1.86 goals per match. This is not an artifact of the model but rather a reflection of the within season rhythm I identified in the STL decomposition. Some matchweeks consistently feature more open and higher scoring matches, while others tend to be tighter and more conservative, and the model is picking up on that structure. The prediction intervals are wide, which I think is an honest reflection of how genuinely unpredictable individual weeks of football can be rather than a weakness of the approach.
+
+---
+
+# Key Findings
+
+I came away from this analysis with three main findings that I think are substantively interesting beyond just the model fitting exercise.
+
+**Finding 1: Goal scoring in the Premier League increased meaningfully between 2020 and 2024 before pulling back in 2024/25.** The trend component of the STL decomposition shows a rise from 1.34 goals per team per match in the first season to a peak of 1.639 in 2023/24, which works out to roughly a 22 percent increase over four seasons. This was the highest scoring season in recent Premier League history. The 2024/25 drop back to 1.467 suggests this may have been a peak rather than a permanent shift, though it is too early to say definitively.
+
+**Finding 2: Home advantage has not recovered to its historical level following the COVID affected season.** I found the home win rate data genuinely striking when I looked at it by season.
+
+| Season | Home Win Rate |
+|---|---|
+| 2020/21 with no fans | 37.9 percent |
+| 2021/22 | 42.9 percent |
+| 2022/23 | 48.4 percent |
+| 2023/24 | 46.1 percent |
+| 2024/25 | 40.8 percent |
+
+The historical average is around 43 percent. While home advantage bounced back after fans returned in 2021/22 and peaked in 2022/23, it has since declined again and sits below its historical norm in the most recent season. I think this suggests that home advantage in modern football is more fragile and context dependent than the conventional wisdom assumes, and that the COVID period may have partially reset some of the psychological and logistical mechanisms that underpinned it.
+
+**Finding 3: Expected goals is an approximately unbiased predictor of actual goals at the weekly aggregate level.** The xG coefficient of 1.036 being so close to 1.0 tells me that when you average across all teams and all matches in a given week, the league scores very close to what the quality of its chances would predict. This is a useful validation of the metric itself and helps explain why adding xG to the model cuts forecast error in half.
+
+---
+
+# Limitations
+
+I want to be upfront about several limitations of this analysis because I think being honest about them is part of doing good temporal research.
+
+**First, aggregating to the league level hides a lot of team level variation.** When I average across all 20 Premier League teams in a given week, I am combining clubs with very different levels of quality, tactical styles, and scoring patterns. A team like Manchester City or Arsenal will have a very different goal scoring profile than a side fighting relegation. A team level or panel model would give a much richer picture, but it would also move outside the univariate time series scope I was working within for this project.
+
+**Second, expected goals is not truly exogenous in the causal sense.** I am using xG from the same week as actual goals, which means it is a contemporaneous predictor rather than a leading indicator. This is fine for improving in sample fit and for short run forecasting when you have an independent xG prediction, but it limits how far ahead I can genuinely forecast without making additional assumptions. A proper two stage approach would first model and forecast xG independently before using it to predict goals.
+
+**Third, I could not use a seasonal ARIMA because I did not have enough seasons.** With only five complete seasons and a seasonal period of 38 matchweeks, I simply did not have enough observations to estimate a full SARIMA model reliably. I chose to work within that constraint rather than force a model that was not supported by the data length.
+
+**Fourth, the 2020/21 season without fans is unusual data.** I included it because removing it would reduce my already limited sample, but I acknowledge that matches played in empty stadiums represent a genuinely different context from normal football. This likely adds some noise to my estimates and may be one reason why home advantage patterns look unusual in that season.
+
+**Fifth, this is a forecasting study and not a causal one.** I am not claiming that xG or any other variable causes goal scoring to change. The relationships I have estimated are associational. Identifying what actually drives the upward trend in goal scoring or the erosion of home advantage would require a different kind of research design with exogenous variation, which is beyond the scope of what time series modeling alone can provide.
+
+---
+
+# Conclusion
+
+I set out in this project to model whether weekly goal scoring in the English Premier League follows a detectable temporal pattern across five seasons, and whether that pattern can be used to forecast future performance. Based on my analysis I think the answer to both questions is yes, with some important caveats.
+
+The final model I ended up with is an ARIMA(1,0,2) specification augmented with expected goals as an exogenous predictor. I chose this model based on its superior AIC, BIC, and out of sample performance compared to the univariate baseline. On the held out 2024/25 test season it achieved an RMSE of 0.165 and an MAE of 0.131, cutting the baseline error roughly in half. The residual diagnostics all pass cleanly, which gives me confidence that the model is well specified and not just overfitting.
+
+The three substantive findings I take away from this analysis are that Premier League goal scoring trended upward significantly between 2020 and 2024 before a mild pullback in 2024/25, that home advantage has not returned to its historical norm of around 43 percent even four seasons after fans came back, and that expected goals is an approximately unbiased predictor of actual goals at the weekly aggregate level with an estimated coefficient of 1.036.
+
+If I were to extend this work, I would want to build a team level panel model that captures the heterogeneity across clubs that my weekly aggregation necessarily smooths over. I would also want to build a proper two stage model where xG is first forecast independently before being used to predict actual goals, which would make the out of sample forecasting exercise more genuinely predictive. Finally I think a structural break analysis specifically targeting the COVID season would be worth doing carefully, since my informal look at home win rates suggests that something may have permanently shifted in how home advantage operates in modern football.
+
+---
+
+# References
+
+Dixon, M. J., and Coles, S. G. (1997). Modelling association football scores and inefficiencies in the football betting market. Journal of the Royal Statistical Society Series C Applied Statistics, 46(2), 265 to 280. https://doi.org/10.1111/1467-9876.00065
+
+Hyndman, R. J., and Athanasopoulos, G. (2021). Forecasting: Principles and Practice, 3rd edition. OTexts. https://otexts.com/fpp3/
+
+Karlis, D., and Ntzoufras, I. (2003). Analysis of sports data by using bivariate Poisson models. Journal of the Royal Statistical Society Series D The Statistician, 52(3), 381 to 393. https://doi.org/10.1111/1467-9884.00366
+
+---
+
+*Submitted for DACSS 790D: Temporal Dynamics, Spring 2026. Stage 3 Final Submission.*
